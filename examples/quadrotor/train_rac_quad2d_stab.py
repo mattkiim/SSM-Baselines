@@ -6,6 +6,7 @@ import glob
 import inspect
 import json
 import os
+import sys
 from typing import Callable, Dict, Optional
 
 import numpy as np
@@ -13,6 +14,15 @@ import tqdm
 from absl import app, flags
 from ml_collections import config_flags
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from examples.quadrotor.quad2d_stab_eval import (
+    evaluate_initial_states,
+    make_fixed_vel_small_states,
+    sample_lowz_hrej_initial_states_stab,
+)
 from jaxrl5.agents.rac.rac_learner import RACLearner
 from jaxrl5.data import ReplayBuffer
 from jaxrl5.envs import make_env
@@ -23,76 +33,86 @@ from jaxrl5.wrappers.termination_penalty import TerminationPenaltyWrapper
 
 FLAGS = flags.FLAGS
 
-# Example 3D evaluation starts.
-# State is [px, py, pz, vx, vy, vz, phi, theta, psi].
-EVAL_STARTS = [
-    ( 0.5,  0.0, -0.3),
-    (-0.5,  0.0, -0.3),
-    ( 0.0,  0.5, -0.4),
-    ( 0.0, -0.5, -0.2),
-]
-
-flags.DEFINE_string("project_name", "jaxrl5_quad3d_rac", "wandb project name.")
+flags.DEFINE_string("project_name", "jaxrl5_quad2d_stab_rac", "wandb project name.")
 flags.DEFINE_string("run_name", "", "wandb run name.")
-flags.DEFINE_string("env_name", "QuadrotorStabilization3D-v0", "Environment name.")
+flags.DEFINE_string("env_name", "QuadrotorStabilization2D-v0", "Environment name.")
 flags.DEFINE_integer("seed", 0, "Random seed.")
-flags.DEFINE_integer("eval_episodes", 4, "Evaluation episodes.")
-flags.DEFINE_integer("log_interval", 400, "Logging interval (steps).")
-flags.DEFINE_integer("eval_interval", 5000, "Evaluation interval (steps).")
+flags.DEFINE_integer("log_interval", 400, "Logging interval.")
+flags.DEFINE_integer("eval_interval", 5000, "Evaluation interval.")
 flags.DEFINE_integer("batch_size", 256, "Mini batch size.")
 flags.DEFINE_integer("max_steps", 200_000, "Number of training steps.")
 flags.DEFINE_integer("start_training", 10_000, "Number of steps before learning starts.")
 flags.DEFINE_boolean("wandb", False, "Enable wandb logging.")
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
 flags.DEFINE_integer("utd_ratio", 1, "Update-to-data ratio.")
-flags.DEFINE_integer("eval_seed_offset", 12345, "Offset for evaluation environment seed.")
-flags.DEFINE_boolean("save_video", False, "Upload videos during evaluation (wandb only).")
+flags.DEFINE_integer("eval_seed_offset", 12345, "Offset for evaluation sampling.")
+flags.DEFINE_integer("eval_rollouts", 200, "Rollouts per eval suite.")
+flags.DEFINE_boolean("save_video", False, "Upload videos during evaluation when wandb is enabled.")
 flags.DEFINE_integer("save_interval", 5000, "Checkpoint save interval.")
 flags.DEFINE_enum("mode", "training", ["training", "testing"], "Run mode.")
 flags.DEFINE_string("load_dir", "", "Directory containing checkpoints for testing.")
 flags.DEFINE_integer("load_step", None, "Checkpoint step to load for testing.")
 flags.DEFINE_string(
     "results_root",
-    "results/QuadrotorStabilization3D-v0/jaxrl5_quad3d_rac",
+    "results/QuadrotorStabilization2D-v0/jaxrl5_quad2d_stab_rac",
     "Root directory for experiment outputs.",
 )
+
+flags.DEFINE_string("layout_name", "corridor_v2", "Quad2D stabilization layout.")
+flags.DEFINE_string("reset_mode", "simple_under3", "Training reset mode.")
+flags.DEFINE_string("obs_feature_mode", "state", "Observation feature mode.")
+flags.DEFINE_float("q_x", 2.0, "Position x reward weight for warm_anchor_fork20_mirror_qx2.")
+flags.DEFINE_float("q_z", 10.0, "Position z reward weight.")
+flags.DEFINE_float("simple_bar", 0.24, "simple_under3 bar_under reset fraction.")
+flags.DEFINE_float("simple_left", 0.08, "simple_under3 left_block_under reset fraction.")
+flags.DEFINE_float("simple_right", 0.08, "simple_under3 right_block_under reset fraction.")
+flags.DEFINE_float("simple_gap", 0.08, "simple_under3 gap_entry reset fraction.")
+flags.DEFINE_float("simple_low", 0.20, "simple_under3 low_uniform reset fraction.")
+flags.DEFINE_float("simple_near", 0.12, "simple_under3 near_goal reset fraction.")
+flags.DEFINE_float("simple_fork", 0.20, "simple_under3 fork reset fraction.")
+
 config_flags.DEFINE_config_file(
     "config",
-    "examples/quadrotor/configs/rac_quad3d_config.py",
+    "examples/quadrotor/configs/rac_quad2d_stab_config.py",
     "Path to RAC hyperparameter configuration.",
     lock_config=False,
 )
 
 
-def _maybe_init_wandb():
+def _env_kwargs() -> Dict:
+    return {
+        "layout_name": FLAGS.layout_name,
+        "reset_mode": FLAGS.reset_mode,
+        "obs_feature_mode": FLAGS.obs_feature_mode,
+        "q_x": FLAGS.q_x,
+        "q_z": FLAGS.q_z,
+        "reset_simple_bar_frac": FLAGS.simple_bar,
+        "reset_simple_left_block_frac": FLAGS.simple_left,
+        "reset_simple_right_block_frac": FLAGS.simple_right,
+        "reset_simple_gap_frac": FLAGS.simple_gap,
+        "reset_simple_low_uniform_frac": FLAGS.simple_low,
+        "reset_simple_near_frac": FLAGS.simple_near,
+        "reset_simple_side_frac": 0.0,
+        "reset_simple_fork_frac": FLAGS.simple_fork,
+    }
+
+
+def _maybe_init_wandb() -> None:
     if not FLAGS.wandb:
         return
-
     try:
         import wandb
     except ImportError:
         print("wandb is not installed; disabling wandb logging.")
         FLAGS.wandb = False
         return
-
-    run_name = FLAGS.run_name or None
-    try:
-        wandb.init(
-            project=FLAGS.project_name,
-            name=run_name,
-            tags=[FLAGS.run_name] if FLAGS.run_name else None,
-        )
-    except Exception as exc:
-        print(f"wandb init failed ({exc}); disabling wandb logging.")
-        FLAGS.wandb = False
-        return
-
+    wandb.init(project=FLAGS.project_name, name=FLAGS.run_name or None)
     wandb.config.update(FLAGS)
 
 
-def _make_env(env_name: str, seed: int, allow_video: bool = True):
+def _make_env(seed: int, allow_video: bool = True):
     ensure_custom_envs_registered()
-    env = make_env(env_name, seed=seed)
+    env = make_env(FLAGS.env_name, seed=seed, **_env_kwargs())
     if allow_video and FLAGS.wandb and FLAGS.save_video:
         env = WANDBVideo(env)
     return env
@@ -109,71 +129,12 @@ def _make_eval_policy(agent: RACLearner) -> Callable[[np.ndarray], np.ndarray]:
     return policy
 
 
-def evaluate_four_starts(env, policy_fn, seed: int = 0):
-    """Evaluate on 4 fixed 3D initial positions."""
-    returns = []
-    costs = []
-    ep_lens = []
-    viol_rates = []
-
-    for i, (px0, py0, pz0) in enumerate(EVAL_STARTS):
-        obs, _ = env.reset(
-            seed=seed + i,
-            options={
-                "init_px": px0,
-                "init_py": py0,
-                "init_pz": pz0,
-                "init_vx": 0.0,
-                "init_vy": 0.0,
-                "init_vz": 0.0,
-                "init_phi": 0.0,
-                "init_theta": 0.0,
-                "init_psi": 0.0,
-            },
-        )
-
-        ep_ret = 0.0
-        ep_cost = 0.0
-        steps = 0
-        viol_sum = 0.0
-
-        terminated = False
-        truncated = False
-        while not (terminated or truncated):
-            act = policy_fn(obs)
-            obs, r, c, terminated, truncated, info = env.step(act)
-            ep_ret += float(r)
-            ep_cost += float(c)
-            viol_sum += float(c)
-            steps += 1
-
-        returns.append(ep_ret)
-        costs.append(ep_cost)
-        ep_lens.append(steps)
-        viol_rates.append(viol_sum / max(1, steps))
-
-    returns = np.asarray(returns, np.float32)
-    costs = np.asarray(costs, np.float32)
-    ep_lens = np.asarray(ep_lens, np.float32)
-    viol_rates = np.asarray(viol_rates, np.float32)
-
-    return {
-        "eval/return_mean": float(returns.mean()),
-        "eval/return_std": float(returns.std()),
-        "eval/cost_mean": float(costs.mean()),
-        "eval/cost_std": float(costs.std()),
-        "eval/ep_len_mean": float(ep_lens.mean()),
-        "eval/ep_len_std": float(ep_lens.std()),
-        "eval/violation_rate_mean": float(viol_rates.mean()),
-        "eval/violation_rate_std": float(viol_rates.std()),
-    }
-
-
 def _save_config(run_dir: str) -> None:
     os.makedirs(run_dir, exist_ok=True)
     cfg = {
         "flags": {k: v for k, v in FLAGS.flag_values_dict().items() if k != "config"},
         "config": FLAGS.config.to_dict(),
+        "env_kwargs": _env_kwargs(),
     }
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
@@ -181,7 +142,8 @@ def _save_config(run_dir: str) -> None:
 
 def _format_run_dir(seed: int) -> str:
     date_str = datetime.date.today().strftime("%Y-%m-%d")
-    return os.path.join(FLAGS.results_root, f"{date_str}_seed{seed:04d}")
+    suffix = FLAGS.run_name or f"seed{seed:04d}"
+    return os.path.join(FLAGS.results_root, f"{date_str}_{suffix}")
 
 
 def _save_checkpoint(agent: RACLearner, ckpt_dir: str, step: int) -> str:
@@ -214,24 +176,33 @@ def _filter_create_kwargs(cfg: Dict) -> Dict:
     return {k: v for k, v in cfg.items() if k in allowed}
 
 
-def _run_evaluation(agent: RACLearner, eval_env, step: int, experiment_name: str):
-    eval_policy = _make_eval_policy(agent)
-
-    metrics_all = evaluate_four_starts(
+def _run_evaluation(agent: RACLearner, eval_env, step: int, experiment_name: str) -> Dict[str, float]:
+    policy = _make_eval_policy(agent)
+    lowz_states = sample_lowz_hrej_initial_states_stab(
         eval_env,
-        eval_policy,
+        n=FLAGS.eval_rollouts,
         seed=FLAGS.seed + FLAGS.eval_seed_offset,
+        z_high=0.50,
     )
+    fixed_states = make_fixed_vel_small_states(
+        n=FLAGS.eval_rollouts,
+        seed=FLAGS.seed + FLAGS.eval_seed_offset + 1,
+    )
+    lowz = evaluate_initial_states(eval_env, policy, lowz_states)
+    fixed = evaluate_initial_states(eval_env, policy, fixed_states)
+    metrics = {f"eval_lowz050_hrej/{k.removeprefix('eval/')}": v for k, v in lowz.items()}
+    metrics.update({f"eval_fixed_vel_small/{k.removeprefix('eval/')}": v for k, v in fixed.items()})
 
     if FLAGS.wandb:
         import wandb
-        wandb.log(metrics_all, step=step)
+
+        wandb.log(metrics, step=step)
     else:
         print(
-            f"[step {step}] return={metrics_all['eval/return_mean']:.2f} "
-            f"cost={metrics_all['eval/cost_mean']:.2f} "
-            f"viol_rate={metrics_all['eval/violation_rate_mean']:.3f} "
-            f"len={metrics_all['eval/ep_len_mean']:.1f}"
+            f"[step {step}] lowz_ret={metrics['eval_lowz050_hrej/return_mean']:.2f} "
+            f"lowz_cost={metrics['eval_lowz050_hrej/cost_mean']:.2f} "
+            f"fixed_ret={metrics['eval_fixed_vel_small/return_mean']:.2f} "
+            f"fixed_cost={metrics['eval_fixed_vel_small/cost_mean']:.2f}"
         )
 
     append_history(
@@ -240,39 +211,26 @@ def _run_evaluation(agent: RACLearner, eval_env, step: int, experiment_name: str
         experiment_name,
         FLAGS.seed,
         {
-            "eval/return_mean": metrics_all["eval/return_mean"],
-            "eval/return_std": metrics_all["eval/return_std"],
-            "eval/cost_mean": metrics_all["eval/cost_mean"],
-            "eval/cost_std": metrics_all.get("eval/cost_std", float("nan")),
-            "eval/violation_rate_mean": metrics_all["eval/violation_rate_mean"],
-            "eval/violation_rate_std": metrics_all.get("eval/violation_rate_std", float("nan")),
-            "eval/ep_len_mean": metrics_all["eval/ep_len_mean"],
+            "eval/return_mean": metrics["eval_lowz050_hrej/return_mean"],
+            "eval/cost_mean": metrics["eval_lowz050_hrej/cost_mean"],
+            "eval/violation_rate_mean": metrics["eval_lowz050_hrej/violation_rate_mean"],
+            "eval/fixed_return_mean": metrics["eval_fixed_vel_small/return_mean"],
+            "eval/fixed_cost_mean": metrics["eval_fixed_vel_small/cost_mean"],
         },
     )
-    return metrics_all
+    return metrics
 
 
 def _training_loop(run_dir: str) -> None:
     _maybe_init_wandb()
-
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     _save_config(run_dir)
 
-    train_env = _make_env(FLAGS.env_name, seed=FLAGS.seed, allow_video=True)
-    eval_env = _make_env(
-        FLAGS.env_name, seed=FLAGS.seed + FLAGS.eval_seed_offset, allow_video=True
-    )
+    train_env = _make_env(FLAGS.seed, allow_video=True)
+    eval_env = _make_env(FLAGS.seed + FLAGS.eval_seed_offset, allow_video=True)
+    train_env = TerminationPenaltyWrapper(train_env, penalty=0.0, apply_on_truncated=False)
 
-    obs_shape = train_env.observation_space.shape
-    act_shape = train_env.action_space.shape
-
-    train_env = TerminationPenaltyWrapper(
-        train_env,
-        # penalty=100.0,
-        apply_on_truncated=False,
-    )
-
-    replay_buffer = ReplayBuffer(obs_shape, act_shape, capacity=FLAGS.max_steps)
+    replay_buffer = ReplayBuffer(train_env.observation_space.shape, train_env.action_space.shape, capacity=FLAGS.max_steps)
     replay_buffer.seed(FLAGS.seed)
 
     kwargs = _filter_create_kwargs(dict(FLAGS.config))
@@ -287,30 +245,17 @@ def _training_loop(run_dir: str) -> None:
     observation, _ = train_env.reset(seed=FLAGS.seed)
     episode_return, episode_cost, episode_length = 0.0, 0.0, 0
     experiment_name = FLAGS.run_name or FLAGS.project_name
+    update_info: Dict[str, float] = {}
 
-    for step in tqdm.tqdm(
-        range(1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
-    ):
+    for step in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm):
         if step < FLAGS.start_training:
             action = np.asarray(train_env.action_space.sample(), dtype=np.float32)
         else:
             action, agent = agent.sample_actions(np.asarray(observation, dtype=np.float32))
-            action = np.asarray(action, dtype=np.float32)
-            action = np.clip(action, train_env.action_space.low, train_env.action_space.high)
+            action = np.clip(np.asarray(action, dtype=np.float32), train_env.action_space.low, train_env.action_space.high)
 
-        next_obs, reward, cost, terminated, truncated, info = train_env.step(action)
-        done = bool(terminated or truncated)
-
-        replay_buffer.insert(
-            observation,
-            action,
-            float(reward),
-            float(cost),
-            next_obs,
-            terminated,
-            truncated,
-        )
-
+        next_obs, reward, cost, terminated, truncated, _info = train_env.step(action)
+        replay_buffer.insert(observation, action, float(reward), float(cost), next_obs, terminated, truncated)
         episode_return += float(reward)
         episode_cost += float(cost)
         episode_length += 1
@@ -320,14 +265,15 @@ def _training_loop(run_dir: str) -> None:
             for _ in range(FLAGS.utd_ratio):
                 batch = replay_buffer.sample(FLAGS.batch_size)
                 agent, update_info = agent.update(batch)
-
             if FLAGS.wandb and step % FLAGS.log_interval == 0:
                 import wandb
+
                 wandb.log({f"training/{k}": float(v) for k, v in update_info.items()}, step=step)
 
-        if done:
+        if terminated or truncated:
             if FLAGS.wandb:
                 import wandb
+
                 wandb.log(
                     {
                         "training/return": episode_return,
@@ -336,7 +282,6 @@ def _training_loop(run_dir: str) -> None:
                     },
                     step=step,
                 )
-
             observation, _ = train_env.reset()
             episode_return, episode_cost, episode_length = 0.0, 0.0, 0
 
@@ -353,21 +298,11 @@ def _training_loop(run_dir: str) -> None:
 def _testing_loop() -> None:
     if not FLAGS.load_dir:
         raise ValueError("--load_dir is required in testing mode.")
-
     ckpt_path = _find_checkpoint(FLAGS.load_dir, FLAGS.load_step)
     agent = _load_checkpoint(ckpt_path)
-
-    eval_env = _make_env(
-        FLAGS.env_name, seed=FLAGS.seed + FLAGS.eval_seed_offset, allow_video=False
-    )
-    experiment_name = FLAGS.run_name or FLAGS.project_name
-    metrics = _run_evaluation(
-        agent, eval_env, step=FLAGS.load_step or 0, experiment_name=experiment_name
-    )
-
-    result_path = os.path.join(
-        FLAGS.load_dir, f"test_results_step{FLAGS.load_step or 'latest'}.json"
-    )
+    eval_env = _make_env(FLAGS.seed + FLAGS.eval_seed_offset, allow_video=False)
+    metrics = _run_evaluation(agent, eval_env, step=FLAGS.load_step or 0, experiment_name=FLAGS.run_name or FLAGS.project_name)
+    result_path = os.path.join(FLAGS.load_dir, f"test_results_step{FLAGS.load_step or 'latest'}.json")
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     eval_env.close()
@@ -378,8 +313,7 @@ def main(_):
     if FLAGS.mode == "testing":
         _testing_loop()
     else:
-        run_dir = _format_run_dir(FLAGS.seed)
-        _training_loop(run_dir)
+        _training_loop(_format_run_dir(FLAGS.seed))
 
 
 if __name__ == "__main__":

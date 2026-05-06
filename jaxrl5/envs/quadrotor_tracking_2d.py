@@ -193,12 +193,29 @@ class QuadrotorTracking2DEnv(gym.Env):
         action_err = action - self.a_ref
         reward = -float(state_err @ self.Q @ state_err + action_err @ self.R @ action_err)
 
+        # x = float(self.state[0])
+        # z = float(self.state[2])
+        # h = max(0.5 - z, z - 1.5)
+        # cost = float(h > 0.0)
+        
         x = float(self.state[0])
         z = float(self.state[2])
-        h = max(0.5 - z, z - 1.5)
+
+        h_altitude = max(0.5 - z, z - 1.5)   # altitude band: 0.5 <= z <= 1.5
+        h_lateral = abs(x) - 2.0              # domain bound: |x| <= 2
+        h_vertical_oob = abs(z) - 3.0         # domain bound: |z| <= 3
+
+        h = max(h_altitude, h_lateral, h_vertical_oob)
         cost = float(h > 0.0)
 
-        terminated = bool(abs(x) > 2.0 or abs(z) > 3.0)
+        terminated = bool((abs(x) > 2.0) or (abs(z) > 3.0))
+        
+        if terminated:
+            remaining_frac = (self.max_episode_steps - self._t) / float(self.max_episode_steps)
+            reward -= 500.0 * (1.0 + max(remaining_frac, 0.0))
+
+
+        # terminated = bool(abs(x) > 2.0 or abs(z) > 3.0)
         self._t += 1
         truncated = bool(self._t >= self.max_episode_steps)
 

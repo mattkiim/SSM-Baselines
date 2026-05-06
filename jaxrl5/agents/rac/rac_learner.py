@@ -86,18 +86,93 @@ from jaxrl5.networks import Ensemble, MLP, StateActionValue, subsample_ensemble
 #         return jnp.squeeze(h, axis=0)
 #     return h
 
-def compute_h_from_obs(obs: jnp.ndarray) -> jnp.ndarray:
+SAFETY_H_MODE_QUAD2D = "quad2d"
+SAFETY_H_MODE_QUAD2D_STAB_V2 = "quad2d_stab_v2"
+SAFETY_H_MODE_QUAD2D_STAB_V3 = "quad2d_stab_v3"
+SAFETY_H_MODE_QUAD3D = "quad3d"
+SAFETY_H_MODE_F16_TASK_FEATURE = "f16_task_feature"
+SAFETY_H_MODES = (
+    SAFETY_H_MODE_QUAD2D,
+    SAFETY_H_MODE_QUAD2D_STAB_V2,
+    SAFETY_H_MODE_QUAD2D_STAB_V3,
+    SAFETY_H_MODE_QUAD3D,
+    SAFETY_H_MODE_F16_TASK_FEATURE,
+)
+
+
+def _quad2d_stab_rect_h(
+    x: jnp.ndarray,
+    z: jnp.ndarray,
+    cx: float,
+    cz: float,
+    sx: float,
+    sz: float,
+    margin: float,
+) -> jnp.ndarray:
+    hx = 0.5 * sx + margin
+    hz = 0.5 * sz + margin
+    qx = jnp.abs(x - cx) - hx
+    qz = jnp.abs(z - cz) - hz
+    outside = jnp.sqrt(jnp.square(jnp.maximum(qx, 0.0)) + jnp.square(jnp.maximum(qz, 0.0)))
+    inside = jnp.minimum(jnp.maximum(qx, qz), 0.0)
+    return -(outside + inside)
+
+
+def _quad2d_stab_h_from_xz(x: jnp.ndarray, z: jnp.ndarray, layout: str) -> jnp.ndarray:
+    if layout == "corridor_v3":
+        rects = (
+            (0.0, 0.30, 1.30, 0.30),
+            (-1.72, 0.30, 0.32, 0.32),
+            (1.72, 0.30, 0.32, 0.32),
+            (0.0, 1.55, 0.34, 0.74),
+        )
+    else:
+        rects = (
+            (0.0, 0.30, 2.00, 0.30),
+            (-1.84, 0.30, 0.44, 0.44),
+            (1.84, 0.30, 0.44, 0.44),
+            (0.0, 1.55, 0.38, 0.86),
+        )
+    h = _quad2d_stab_rect_h(x, z, *rects[0], margin=0.10)
+    for rect in rects[1:]:
+        h = jnp.maximum(h, _quad2d_stab_rect_h(x, z, *rect, margin=0.10))
+    h_boundary = jnp.maximum(
+        jnp.maximum(-2.78 + 0.10 - x, x - (2.78 - 0.10)),
+        jnp.maximum(-1.55 + 0.10 - z, z - (3.10 - 0.10)),
+    )
+    return jnp.maximum(h, h_boundary)
+
+
+def compute_h_from_obs(obs: jnp.ndarray, safety_h_mode: str) -> jnp.ndarray:
     obs = jnp.asarray(obs)
     single = obs.ndim == 1
     if single:
         obs = obs[None]
 
-    pz = obs[:, 2]
-    state_norm = jnp.linalg.norm(obs[:, :9], axis=-1)
+    if safety_h_mode == SAFETY_H_MODE_F16_TASK_FEATURE:
+        # F16 observations are encoded as [state_enc(24), task_feats], where
+        # the first task feature is tanh(h_margin).
+        h_tanh = jnp.clip(obs[:, 24], -0.999, 0.999)
+        h = jnp.arctanh(h_tanh)
+    elif safety_h_mode == SAFETY_H_MODE_QUAD2D:
+        z = obs[:, 2]
+        h = jnp.maximum(0.5 - z, z - 1.5)
+    elif safety_h_mode == SAFETY_H_MODE_QUAD2D_STAB_V2:
+        h = _quad2d_stab_h_from_xz(obs[:, 0], obs[:, 2], "corridor_v2")
+    elif safety_h_mode == SAFETY_H_MODE_QUAD2D_STAB_V3:
+        h = _quad2d_stab_h_from_xz(obs[:, 0], obs[:, 2], "corridor_v3")
+    elif safety_h_mode == SAFETY_H_MODE_QUAD3D:
+        pz = obs[:, 2]
+        state_norm = jnp.linalg.norm(obs[:, :9], axis=-1)
 
-    h_floor = pz - 0.0
-    h_radius = state_norm - 3.0
-    h = jnp.maximum(h_floor, h_radius)
+        h_floor = pz - 0.0
+        h_radius = state_norm - 3.0
+        h = jnp.maximum(h_floor, h_radius)
+    else:
+        raise ValueError(
+            f"Unsupported safety_h_mode={safety_h_mode!r}. "
+            f"Expected one of {SAFETY_H_MODES}."
+        )
 
     if single:
         return jnp.squeeze(h, axis=0)
@@ -124,6 +199,7 @@ class RACLearner(Agent):
     num_min_qs: Optional[int] = struct.field(pytree_node=False)
     policy_update_period: int = struct.field(pytree_node=False)
     multiplier_update_period: int = struct.field(pytree_node=False)
+    safety_h_mode: str = struct.field(pytree_node=False, default=SAFETY_H_MODE_QUAD3D)
 
     @classmethod
     def create(
@@ -146,10 +222,17 @@ class RACLearner(Agent):
         num_min_qs: Optional[int] = None,
         lambda_max: float = 100.0,
         safety_threshold: float = 0.0,
+        safety_h_mode: str = SAFETY_H_MODE_QUAD3D,
         policy_update_period: int = 1,
         multiplier_update_period: int = 1,
         init_temperature: float = 1.0,
     ) -> "RACLearner":
+        if safety_h_mode not in SAFETY_H_MODES:
+            raise ValueError(
+                f"Unsupported safety_h_mode={safety_h_mode!r}. "
+                f"Expected one of {SAFETY_H_MODES}."
+            )
+
         action_dim = action_space.shape[-1]
         observations = observation_space.sample()
         actions = action_space.sample()
@@ -234,6 +317,7 @@ class RACLearner(Agent):
             target_entropy=target_entropy,
             lambda_max=lambda_max,
             safety_threshold=safety_threshold,
+            safety_h_mode=safety_h_mode,
             update_step=jnp.array(0, dtype=jnp.int32),
             num_qs=num_qs,
             num_min_qs=num_min_qs,
@@ -355,7 +439,9 @@ class RACLearner(Agent):
         self, batch: DatasetDict
     ) -> Tuple["RACLearner", Dict[str, float]]:
         rng = self.rng
-        h = compute_h_from_obs(batch["observations"])
+        h = compute_h_from_obs(batch["observations"], self.safety_h_mode)
+        h_next = compute_h_from_obs(batch["next_observations"], self.safety_h_mode)
+        h_step = jnp.maximum(h, h_next)
 
         dist = self.actor.apply_fn({"params": self.actor.params}, batch["next_observations"])
         key, rng = jax.random.split(rng)
@@ -369,8 +455,10 @@ class RACLearner(Agent):
             True,
             rngs={"dropout": key},
         )
-        target_qh = (1.0 - self.safety_discount) * h + self.safety_discount * jnp.maximum(
-            h, qh_next
+        not_terminated = jnp.asarray(batch["not_terminated"], dtype=jnp.float32)
+        qh_bootstrap = not_terminated * qh_next + (1.0 - not_terminated) * h_step
+        target_qh = (1.0 - self.safety_discount) * h_step + self.safety_discount * jnp.maximum(
+            h_step, qh_bootstrap
         )
 
         key, rng = jax.random.split(rng)
@@ -389,6 +477,8 @@ class RACLearner(Agent):
                 "qh_mean": qh.mean(),
                 "target_qh_mean": target_qh.mean(),
                 "h_mean": h.mean(),
+                "h_next_mean": h_next.mean(),
+                "h_step_mean": h_step.mean(),
             }
 
         grads, info = jax.grad(safety_loss_fn, has_aux=True)(self.safety_critic.params)

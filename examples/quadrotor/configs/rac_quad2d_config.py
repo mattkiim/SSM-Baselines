@@ -17,6 +17,7 @@ def get_config() -> ConfigDict:
     config.target_entropy = None
     config.lambda_max = 100.0
     config.safety_threshold = 0.0
+    config.safety_h_mode = "quad2d"
     config.policy_update_period = 1
     config.multiplier_update_period = 1
     config.init_temperature = 1.0

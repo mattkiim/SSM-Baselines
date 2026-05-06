@@ -91,6 +91,7 @@ class QuadrotorTracking3DEnv(gym.Env):
         # tracking reward weights
         self.Q = np.diag([1.0, 1.0, 1.0, 0.1, 0.1, 0.1, 0.01, 0.01, 0.01]).astype(np.float32)
         self.R = np.diag([1e-2, 1e-3, 1e-3, 1e-3]).astype(np.float32)
+        self.action_penalty = 1e-3
 
         # hover / zero-rate reference action
         self.a_ref = np.array([self.m * self.g, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -256,10 +257,14 @@ class QuadrotorTracking3DEnv(gym.Env):
         obs = self._get_observation()
 
         ref = self._waypoints[self._waypoint_idx]
-        
-        
-        action_err = action - self.a_ref
-        reward = -float(state_err @ self.Q @ state_err + action_err @ self.R @ action_err)
+        state_err = self.state - ref
+
+        # action_err = action - self.a_ref
+        # reward = -float(state_err @ self.Q @ state_err + action_err @ self.R @ action_err)
+        reward = -float(
+            np.sum(np.diag(self.Q) * np.abs(state_err))
+            + self.action_penalty * np.sum(np.abs(action))
+        )
 
         px, py, pz = float(self.state[0]), float(self.state[1]), float(self.state[2])
         radius = np.sqrt(px * px + py * py + pz * pz)

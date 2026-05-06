@@ -6,6 +6,7 @@ from gymnasium.envs.registration import register
 
 _CUSTOM_ENVS = {
     "QuadrotorTracking2D-v0": "jaxrl5.envs.quadrotor_tracking_2d:make_quadrotor_tracking_2d_env",
+    "QuadrotorStabilization2D-v0": "jaxrl5.envs.quadrotor_stabilization_2d:make_quadrotor_stabilization_2d_env",
     "QuadrotorTracking3D-v0": "jaxrl5.envs.quadrotor_tracking_3d:make_quadrotor_tracking_3d_env",
     "QuadrotorStabilization3D-v0": "jaxrl5.envs.quadrotor_stabilization_3d:make_quadrotor_stabilization_3d_env",
 }

@@ -43,7 +43,8 @@ def make_env(
     cost signal derived from their info dict to match the 6-tuple interface.
     """
 
-    if env_name in {"QuadrotorTracking2D-v0", 
+    if env_name in {"QuadrotorTracking2D-v0",
+                    "QuadrotorStabilization2D-v0",
                     "QuadrotorTracking3D-v0",
                     "QuadrotorStabilization3D-v0",
                     }:
