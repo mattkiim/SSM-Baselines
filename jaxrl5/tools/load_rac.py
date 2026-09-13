@@ -24,11 +24,23 @@ def _extract_step(path: str) -> Optional[int]:
 
 
 def _list_checkpoint_candidates(search_dir: Path) -> list[str]:
+    """Return checkpoint paths sorted by step number (ascending).
+
+    Filenames aren't zero-padded (ckpt_100000 vs ckpt_1000000), so a plain
+    string sort would rank "ckpt_950000" after "ckpt_1000000" ('9' > '1')
+    and silently pick the wrong "latest" checkpoint. Sort by the extracted
+    step instead.
+    """
     patterns = ("ckpt_*.msgpack", "ckpt_*")
-    candidates: list[str] = []
+    candidates: set[Path] = set()
     for pattern in patterns:
-        candidates.extend(str(p) for p in sorted(search_dir.glob(pattern)))
-    return candidates
+        candidates.update(search_dir.glob(pattern))
+
+    def _sort_key(p: Path):
+        step = _extract_step(str(p))
+        return (step is None, step if step is not None else -1, str(p))
+
+    return [str(p) for p in sorted(candidates, key=_sort_key)]
 
 
 def _resolve_checkpoint(ckpt_path: str, step: Optional[int]) -> Path:
@@ -82,16 +94,22 @@ def _load_config(path: Path) -> Dict[str, Any]:
 
 def _filter_create_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
     sig = inspect.signature(RACLearner.create)
-    allowed = set(sig.parameters.keys())
+    # seed/observation_space/action_space are supplied explicitly by load_rac's
+    # caller; exclude them here so a saved config that also carries a "seed"
+    # key (e.g. examples/states/configs/rac_config.py) doesn't collide with it.
+    allowed = set(sig.parameters.keys()) - {"seed", "observation_space", "action_space"}
     return {k: v for k, v in cfg.items() if k in allowed}
 
 
 def _build_policy_fn(state_holder: Dict[str, RACLearner], *, deterministic: bool) -> PolicyFn:
     def policy_fn(obs: np.ndarray) -> np.ndarray:
+        # RACLearner.eval_actions/sample_actions already accept an unbatched
+        # (obs_dim,) observation and internally return an unbatched action
+        # (they atleast_2d then squeeze axis 0). Adding a fake batch dim here
+        # and slicing [0] off the result afterwards would strip the first
+        # *action dimension* instead of a batch dimension, since the result
+        # is already unbatched.
         obs_np = np.asarray(obs, dtype=np.float32)
-        single = obs_np.ndim == 1
-        if single:
-            obs_np = obs_np[None]
 
         agent = state_holder["agent"]
         if deterministic and hasattr(agent, "eval_actions"):
@@ -109,8 +127,6 @@ def _build_policy_fn(state_holder: Dict[str, RACLearner], *, deterministic: bool
         else:
             actions = out
 
-        if single:
-            actions = np.asarray(actions)[0]
         return np.asarray(actions, dtype=np.float32)
 
     return policy_fn

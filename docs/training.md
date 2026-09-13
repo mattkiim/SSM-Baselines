@@ -1,6 +1,6 @@
 ## Safety-Gym:
 
-Safety-Gym: 
+Safety-Gym:
 
 - 'SafetyPointButton1-v0'  # 1e5
 - 'SafetyCarButton1-v0'    # 1e5
@@ -8,11 +8,14 @@ Safety-Gym:
 - 'SafetyPointPush1-v0'    # 1e5
 - 'SafetyCarButton2-v0'    # 1e5
 
-MOJOCO: 
+MuJoCo:
 
 
 ### SSM
 
+Run from the repository root:
+
+```bash
 python examples/states/train_safe_matching_online.py \
   --wandb True \
   --project_name gymnasium_long \
@@ -24,3 +27,4 @@ python examples/states/train_safe_matching_online.py \
   --start_training 10000 \
   --eval_interval 2000 \
   --log_interval 1000
+```

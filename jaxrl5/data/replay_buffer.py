@@ -13,6 +13,7 @@ class ReplayBuffer:
         capacity: int,
         obs_dtype: np.dtype = np.float32,
         act_dtype: np.dtype = np.float32,
+        store_safety_h: bool = False,
     ) -> None:
         self.capacity = int(capacity)
         self.size = 0
@@ -23,6 +24,7 @@ class ReplayBuffer:
         self.actions = np.zeros((self.capacity, *act_shape), dtype=act_dtype)
         self.rewards = np.zeros((self.capacity,), dtype=np.float32)
         self.costs = np.zeros((self.capacity,), dtype=np.float32)
+        self.safety_h = np.zeros((self.capacity,), dtype=np.float32) if store_safety_h else None
 
         # Gymnasium termination flags
         self.terminated = np.zeros((self.capacity,), dtype=np.bool_)
@@ -43,7 +45,15 @@ class ReplayBuffer:
         next_obs: np.ndarray,
         terminated: bool,
         truncated: bool,
+        *,
+        safety_h=None,
     ) -> None:
+        if self.safety_h is not None:
+            if safety_h is None or not np.isfinite(safety_h):
+                raise ValueError('A finite safety_h is required for this replay buffer')
+            self.safety_h[self.ptr] = safety_h
+        elif safety_h is not None:
+            raise ValueError('Enable store_safety_h before inserting a safety margin')
         self.observations[self.ptr] = obs
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = float(np.asarray(reward, dtype=np.float32))
@@ -71,6 +81,8 @@ class ReplayBuffer:
             truncated=self.truncated[idxs],
             not_terminated=(~self.terminated[idxs]).astype(np.float32),
         )
+        if self.safety_h is not None:
+            batch['safety_h'] = self.safety_h[idxs]
         return batch
 
     def __len__(self) -> int:

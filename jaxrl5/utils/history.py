@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Dict
 
 
-def _make_history_path(env_name: str, experiment_name: str, seed: int) -> Path:
-    """Return the history.csv path for a given experiment setup.
+def get_run_dir(env_name: str, experiment_name: str, seed: int) -> Path:
+    """Return the run directory for a given experiment setup.
 
-    The path format matches `<experiment_env>/<experiment_name>/<YYYY-MM-DD>_seedXXXX/history.csv`.
+    The path format matches `results/<env_name>/<experiment_name>/<YYYY-MM-DD>_seedXXXX/`.
+    Checkpoints and config files should live alongside history.csv under this directory.
     """
 
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -19,11 +20,18 @@ def _make_history_path(env_name: str, experiment_name: str, seed: int) -> Path:
     experiment = experiment_name or "default_experiment"
     base_dir = "results" / Path(env_name) / experiment / f"{date_str}_{seed_str}"
     base_dir.mkdir(parents=True, exist_ok=True)
-    return base_dir / "history.csv"
+    return base_dir
+
+
+def _make_history_path(env_name: str, experiment_name: str, seed: int) -> Path:
+    """Return the history.csv path for a given experiment setup."""
+
+    return get_run_dir(env_name, experiment_name, seed) / "history.csv"
 
 
 def append_history(
-    step: int, env_name: str, experiment_name: str, seed: int, metrics: Dict[str, float]
+    step: int, env_name: str, experiment_name: str, seed: int, metrics: Dict[str, float],
+    *, run_dir=None,
 ) -> None:
     """Append a metrics row to the experiment history file.
 
@@ -35,7 +43,7 @@ def append_history(
         metrics: Mapping of metric name → value to store.
     """
 
-    history_path = _make_history_path(env_name, experiment_name, seed)
+    history_path = (Path(run_dir) / 'history.csv') if run_dir is not None else _make_history_path(env_name, experiment_name, seed)
     row = {"step": step, **metrics}
 
     # Maintain a deterministic column order so repeated appends are consistent.
@@ -47,4 +55,3 @@ def append_history(
         if write_header:
             writer.writeheader()
         writer.writerow(row)
-

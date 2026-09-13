@@ -7,6 +7,7 @@ from jaxrl5.wrappers.add_cost_from_info import AddCostFromInfo
 from jaxrl5.wrappers.pixels import wrap_pixels
 from jaxrl5.wrappers.record_episode_statistics import SafetyRecordEpisodeStatistics
 from jaxrl5.wrappers.single_precision import SinglePrecision
+from jaxrl5.wrappers.static_layout import StaticLayoutWrapper
 from jaxrl5.wrappers.universal_seed import UniversalSeed
 from jaxrl5.wrappers.wandb_video import WANDBVideo
 
@@ -29,6 +30,7 @@ __all__ = [
     "AddCostFromInfo",
     "SafetyRecordEpisodeStatistics",
     "SinglePrecision",
+    "StaticLayoutWrapper",
     "UniversalSeed",
     "WANDBVideo",
     "wrap_gym",

@@ -1,0 +1,5 @@
+# Install with --no-deps AFTER requirements-rcrl.txt; see docs/portable-setup.md.
+# Robotics 1.2.2 declares numpy<1.24, incompatible with the JAX runtime.
+# Velocity tasks have been tested using the explicit core versions.
+gymnasium-robotics==1.2.2
+safety-gymnasium==1.0.0

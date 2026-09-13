@@ -14,6 +14,26 @@ visual/
 
 examples/quadrotor/figures/
 
-eval*
+/eval*/
 
-Vh_*
+/Vh_*/
+
+# Local runtime and development artifacts
+/logs/
+*.log
+*.py[cod]
+.pytest_cache/
+.venv/
+.venv-*/
+/build/
+/dist/
+
+# Local reference checkouts, supplied paper/plot package, and one-off run scripts
+/Reachability_Constrained_RL/
+/respo-clone/
+/FALCON_eval_plot_package/
+/2205.07536v2.pdf
+/scripts_tmp/
+*.bundle
+.env
+.env.*

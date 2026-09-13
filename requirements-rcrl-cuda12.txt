@@ -1,0 +1,2 @@
+-r requirements-rcrl.txt
+jax[cuda12]==0.6.2

@@ -10,9 +10,11 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import struct
+import flax.linen as nn
 from flax.training.train_state import TrainState
 
 from jaxrl5.agents.agent import Agent
+from jaxrl5.algorithms.reachability import reachability_target
 from jaxrl5.agents.sac.temperature import Temperature
 from jaxrl5.data.dataset import DatasetDict
 from jaxrl5.distributions import TanhNormal
@@ -91,12 +93,26 @@ SAFETY_H_MODE_QUAD2D_STAB_V2 = "quad2d_stab_v2"
 SAFETY_H_MODE_QUAD2D_STAB_V3 = "quad2d_stab_v3"
 SAFETY_H_MODE_QUAD3D = "quad3d"
 SAFETY_H_MODE_F16_TASK_FEATURE = "f16_task_feature"
+# Distance-to-nearest-hazard margin for SafetyCarGoal-v0 (Car robot), reconstructed
+# from the hazards_lidar sensor. Only valid for this exact robot+task observation
+# layout -- see compute_h_from_obs for the flattened index offsets it assumes.
+SAFETY_H_MODE_CARGOAL_LIDAR = "cargoal_lidar"
+# Use the environment's own per-transition `cost` as the safety signal instead
+# of a hand-crafted geometric h(s). For envs (e.g. Safety-Gymnasium tasks) whose
+# safety constraint is not recoverable from a single observation, this mode
+# learns cumulative costs. reachability_transition instead accepts an exact
+# signed transition margin from the environment through replay.
+SAFETY_H_MODE_ENV_COST = "env_cost"
+SAFETY_H_MODE_TRANSITION = "reachability_transition"
 SAFETY_H_MODES = (
     SAFETY_H_MODE_QUAD2D,
     SAFETY_H_MODE_QUAD2D_STAB_V2,
     SAFETY_H_MODE_QUAD2D_STAB_V3,
     SAFETY_H_MODE_QUAD3D,
     SAFETY_H_MODE_F16_TASK_FEATURE,
+    SAFETY_H_MODE_CARGOAL_LIDAR,
+    SAFETY_H_MODE_ENV_COST,
+    SAFETY_H_MODE_TRANSITION,
 )
 
 
@@ -168,6 +184,23 @@ def compute_h_from_obs(obs: jnp.ndarray, safety_h_mode: str) -> jnp.ndarray:
         h_floor = pz - 0.0
         h_radius = state_norm - 3.0
         h = jnp.maximum(h_floor, h_radius)
+    elif safety_h_mode == SAFETY_H_MODE_CARGOAL_LIDAR:
+        # SafetyCarGoal-v0 (Car robot) flattened obs layout (72D):
+        #   accelerometer(3) velocimeter(3) gyro(3) magnetometer(3)
+        #   ballangvel_rear(3) ballquat_rear(9) goal_lidar(16)
+        #   hazards_lidar(16) vases_lidar(16)
+        # Safety-Gymnasium's pseudo-lidar encodes each bin as
+        # (max_dist - dist) / max_dist, so the closest hazard in any
+        # direction is recovered from the single largest bin reading.
+        # These constants match SafetyCarGoal1-v0's registered defaults
+        # (LidarConf.max_dist=3, Hazards.size=0.2); verified against the
+        # env's ground-truth hazard distance to be sign-exact.
+        lidar_max_dist = 3.0
+        hazard_size = 0.2
+        hazards_lidar = obs[:, 40:56]
+        closest_sensor = jnp.max(hazards_lidar, axis=-1)
+        dist_to_nearest_hazard = lidar_max_dist * (1.0 - closest_sensor)
+        h = hazard_size - dist_to_nearest_hazard
     else:
         raise ValueError(
             f"Unsupported safety_h_mode={safety_h_mode!r}. "
@@ -201,6 +234,8 @@ class RACLearner(Agent):
     multiplier_update_period: int = struct.field(pytree_node=False)
     safety_h_mode: str = struct.field(pytree_node=False, default=SAFETY_H_MODE_QUAD3D)
 
+    reference_protocol: bool = struct.field(pytree_node=False, default=False)
+
     @classmethod
     def create(
         cls,
@@ -226,6 +261,8 @@ class RACLearner(Agent):
         policy_update_period: int = 1,
         multiplier_update_period: int = 1,
         init_temperature: float = 1.0,
+        reference_protocol: bool = False,
+        lr_decay_updates: int = 2000000,
     ) -> "RACLearner":
         if safety_h_mode not in SAFETY_H_MODES:
             raise ValueError(
@@ -233,6 +270,25 @@ class RACLearner(Agent):
                 f"Expected one of {SAFETY_H_MODES}."
             )
 
+        if reference_protocol and safety_h_mode != SAFETY_H_MODE_TRANSITION:
+            raise ValueError("Reference protocol requires transition reachability")
+
+        def optimizer(lr, end_lr, period=1, clip_norm=10., ensemble=False):
+            if not reference_protocol:
+                return optax.adam(lr)
+            schedule = optax.linear_schedule(lr, end_lr, max(1, lr_decay_updates // period))
+            clip = optax.clip_by_global_norm(clip_norm)
+            if ensemble:
+                # Reference clips the two reward critics independently.
+                clip = optax.GradientTransformation(
+                    lambda _: optax.EmptyState(),
+                    lambda updates, state, params=None: (
+                        jax.vmap(lambda g: optax.clip_by_global_norm(clip_norm).update(
+                            g, optax.EmptyState())[0])(updates), state))
+            return optax.chain(clip, optax.adam(schedule, eps=1e-7))
+
+        network_kwargs = dict(activations=nn.elu, kernel_init=nn.initializers.he_normal()) if reference_protocol else {}
+        output_kwargs = dict(kernel_init=nn.initializers.he_normal()) if reference_protocol else {}
         action_dim = action_space.shape[-1]
         observations = observation_space.sample()
         actions = action_space.sample()
@@ -247,23 +303,24 @@ class RACLearner(Agent):
             rng, 6
         )
 
-        actor_base_cls = partial(MLP, hidden_dims=hidden_dims, activate_final=True)
-        actor_def = TanhNormal(actor_base_cls, action_dim)
+        actor_base_cls = partial(MLP, hidden_dims=hidden_dims, activate_final=True, **network_kwargs)
+        actor_def = TanhNormal(actor_base_cls, action_dim, **output_kwargs,
+                               **(dict(log_std_min=-5., log_std_max=1.) if reference_protocol else {}))
         actor_params = actor_def.init(actor_key, observations)["params"]
         actor = TrainState.create(
             apply_fn=actor_def.apply,
             params=actor_params,
-            tx=optax.adam(learning_rate=actor_lr),
+            tx=optimizer(actor_lr, 1e-6, policy_update_period),
         )
 
-        critic_base_cls = partial(MLP, hidden_dims=hidden_dims, activate_final=True)
-        critic_cls = partial(StateActionValue, base_cls=critic_base_cls)
+        critic_base_cls = partial(MLP, hidden_dims=hidden_dims, activate_final=True, **network_kwargs)
+        critic_cls = partial(StateActionValue, base_cls=critic_base_cls, **output_kwargs)
         critic_def = Ensemble(critic_cls, num=num_qs)
         critic_params = critic_def.init(critic_key, observations, actions)["params"]
         critic = TrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
-            tx=optax.adam(learning_rate=critic_lr),
+            tx=optimizer(critic_lr, 1e-6, ensemble=True),
         )
         target_critic_def = Ensemble(critic_cls, num=num_min_qs or num_qs)
         target_critic = TrainState.create(
@@ -272,12 +329,12 @@ class RACLearner(Agent):
             tx=optax.GradientTransformation(lambda _: None, lambda _: None),
         )
 
-        safety_def = StateActionValue(critic_base_cls)
+        safety_def = StateActionValue(critic_base_cls, **output_kwargs)
         safety_params = safety_def.init(safety_key, observations, actions)["params"]
         safety_critic = TrainState.create(
             apply_fn=safety_def.apply,
             params=safety_params,
-            tx=optax.adam(learning_rate=safety_lr),
+            tx=optimizer(safety_lr, 1e-6),
         )
         target_safety_critic = TrainState.create(
             apply_fn=safety_def.apply,
@@ -285,12 +342,12 @@ class RACLearner(Agent):
             tx=optax.GradientTransformation(lambda _: None, lambda _: None),
         )
 
-        lambda_def = MLP(hidden_dims=tuple(hidden_dims) + (1,), activate_final=False)
+        lambda_def = MLP(hidden_dims=tuple(hidden_dims) + (1,), activate_final=False, **network_kwargs)
         lambda_params = lambda_def.init(lambda_key, observations)["params"]
         lambda_net = TrainState.create(
             apply_fn=lambda_def.apply,
             params=lambda_params,
-            tx=optax.adam(learning_rate=lambda_lr),
+            tx=optimizer(lambda_lr, 1e-7, multiplier_update_period, clip_norm=3.),
         )
 
         temp_def = Temperature(init_temperature)
@@ -298,7 +355,7 @@ class RACLearner(Agent):
         temp = TrainState.create(
             apply_fn=temp_def.apply,
             params=temp_params,
-            tx=optax.adam(learning_rate=alpha_lr),
+            tx=optimizer(alpha_lr, 3e-6, policy_update_period),
         )
 
         return cls(
@@ -318,6 +375,7 @@ class RACLearner(Agent):
             lambda_max=lambda_max,
             safety_threshold=safety_threshold,
             safety_h_mode=safety_h_mode,
+            reference_protocol=reference_protocol,
             update_step=jnp.array(0, dtype=jnp.int32),
             num_qs=num_qs,
             num_min_qs=num_min_qs,
@@ -331,7 +389,7 @@ class RACLearner(Agent):
             observations,
         )
         lam = jnp.squeeze(jax.nn.softplus(raw), axis=-1)
-        return jnp.clip(lam, 0.0, self.lambda_max)
+        return lam if self.reference_protocol else jnp.clip(lam, 0.0, self.lambda_max)
 
     def _format_obs(self, observations: jnp.ndarray):
         if observations.ndim == 1:
@@ -419,6 +477,7 @@ class RACLearner(Agent):
                 rngs={"dropout": key},
             )
             loss = ((qs - target_q) ** 2).mean()
+            # Mean over two critics equals the sum of their half-MSE losses.
             return loss, {
                 "critic_loss": loss,
                 "q1_mean": qs[0].mean(),
@@ -429,7 +488,9 @@ class RACLearner(Agent):
         grads, info = jax.grad(critic_loss_fn, has_aux=True)(self.critic.params)
         critic = self.critic.apply_gradients(grads=grads)
         target_critic_params = optax.incremental_update(
-            critic.params, self.target_critic.params, self.tau
+            critic.params, self.target_critic.params,
+            jnp.where(self.update_step % self.policy_update_period == 0, self.tau, 0.)
+            if self.reference_protocol else self.tau
         )
         target_critic = self.target_critic.replace(params=target_critic_params)
 
@@ -439,9 +500,6 @@ class RACLearner(Agent):
         self, batch: DatasetDict
     ) -> Tuple["RACLearner", Dict[str, float]]:
         rng = self.rng
-        h = compute_h_from_obs(batch["observations"], self.safety_h_mode)
-        h_next = compute_h_from_obs(batch["next_observations"], self.safety_h_mode)
-        h_step = jnp.maximum(h, h_next)
 
         dist = self.actor.apply_fn({"params": self.actor.params}, batch["next_observations"])
         key, rng = jax.random.split(rng)
@@ -456,10 +514,31 @@ class RACLearner(Agent):
             rngs={"dropout": key},
         )
         not_terminated = jnp.asarray(batch["not_terminated"], dtype=jnp.float32)
-        qh_bootstrap = not_terminated * qh_next + (1.0 - not_terminated) * h_step
-        target_qh = (1.0 - self.safety_discount) * h_step + self.safety_discount * jnp.maximum(
-            h_step, qh_bootstrap
-        )
+
+        if self.safety_h_mode == SAFETY_H_MODE_TRANSITION:
+            h = jnp.asarray(batch['safety_h'], dtype=jnp.float32)
+            if self.reference_protocol:
+                h = 20. * jnp.sign(h)
+            target_qh = reachability_target(h, qh_next, not_terminated, self.safety_discount)
+            h_mean = h.mean()
+        elif self.safety_h_mode == SAFETY_H_MODE_ENV_COST:
+            # `batch["costs"]` is the environment's own per-transition cost,
+            # already aligned with (observations, actions) -> next_observations
+            # exactly like batch["rewards"]. Bellman target is a plain
+            # discounted expected-future-cost sum (no reachability max, no
+            # geometric h(s) needed/available).
+            costs = jnp.asarray(batch["costs"], dtype=jnp.float32)
+            target_qh = costs + self.safety_discount * not_terminated * qh_next
+            h_mean = costs.mean()
+        else:
+            h = compute_h_from_obs(batch["observations"], self.safety_h_mode)
+            h_next = compute_h_from_obs(batch["next_observations"], self.safety_h_mode)
+            h_step = jnp.maximum(h, h_next)
+            qh_bootstrap = not_terminated * qh_next + (1.0 - not_terminated) * h_step
+            target_qh = (1.0 - self.safety_discount) * h_step + self.safety_discount * jnp.maximum(
+                h_step, qh_bootstrap
+            )
+            h_mean = h.mean()
 
         key, rng = jax.random.split(rng)
 
@@ -476,15 +555,15 @@ class RACLearner(Agent):
                 "safety_critic_loss": loss,
                 "qh_mean": qh.mean(),
                 "target_qh_mean": target_qh.mean(),
-                "h_mean": h.mean(),
-                "h_next_mean": h_next.mean(),
-                "h_step_mean": h_step.mean(),
+                "h_mean": h_mean,
             }
 
         grads, info = jax.grad(safety_loss_fn, has_aux=True)(self.safety_critic.params)
         safety_critic = self.safety_critic.apply_gradients(grads=grads)
         target_params = optax.incremental_update(
-            safety_critic.params, self.target_safety_critic.params, self.safety_tau
+            safety_critic.params, self.target_safety_critic.params,
+            jnp.where(self.update_step % self.policy_update_period == 0, self.safety_tau, 0.)
+            if self.reference_protocol else self.safety_tau
         )
         target_safety_critic = self.target_safety_critic.replace(params=target_params)
 
@@ -539,7 +618,8 @@ class RACLearner(Agent):
     def update_temperature(self, entropy: jnp.ndarray) -> Tuple["RACLearner", Dict[str, float]]:
         def temperature_loss_fn(temp_params):
             temperature = self.temp.apply_fn({"params": temp_params})
-            temp_loss = temperature * (entropy - self.target_entropy).mean()
+            coefficient = temp_params["log_temp"] if self.reference_protocol else temperature
+            temp_loss = coefficient * jax.lax.stop_gradient(entropy - self.target_entropy).mean()
             return temp_loss, {
                 "alpha": temperature,
                 "temperature_loss": temp_loss,
@@ -563,6 +643,8 @@ class RACLearner(Agent):
             rngs={"dropout": key2},
         )
         qh_term = qh - self.safety_threshold
+        if self.reference_protocol:
+            qh_term = jnp.clip(qh_term, -10., 100.)
 
         def lambda_loss_fn(params):
             lam = self._lambda_values(batch["observations"], params=params)
@@ -611,6 +693,8 @@ class RACLearner(Agent):
         step = agent.update_step + jnp.array(1, dtype=jnp.int32)
         agent = agent.replace(update_step=step)
 
+        snapshot = agent
+
         # 2) always update critics
         agent, critic_info = agent.update_critic(batch)
         agent, safety_info = agent.update_safety_critic(batch)
@@ -619,8 +703,13 @@ class RACLearner(Agent):
         zeros = agent._zeros_like_metrics()
 
         def do_policy(a: "RACLearner"):
+            current = a
+            if a.reference_protocol:
+                a = snapshot.replace(rng=a.rng)
             a, actor_info = a.update_actor(batch)
             a, temp_info = a.update_temperature(actor_info["entropy"])
+            if a.reference_protocol:
+                a = current.replace(actor=a.actor, temp=a.temp, rng=a.rng)
             return a, {
                 "actor_loss": actor_info["actor_loss"],
                 "entropy": actor_info["entropy"],
@@ -643,7 +732,12 @@ class RACLearner(Agent):
 
         # 4) multiplier periodic update via lax.cond
         def do_lambda(a: "RACLearner"):
+            current = a
+            if a.reference_protocol:
+                a = snapshot.replace(rng=a.rng)
             a, mul_info = a.update_multiplier(batch)
+            if a.reference_protocol:
+                a = current.replace(lambda_net=a.lambda_net, rng=a.rng)
             return a, {
                 "lambda_mean": mul_info["lambda_mean"],
                 "lambda_max": mul_info["lambda_max"],

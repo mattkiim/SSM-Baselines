@@ -1,20 +1,74 @@
-# Infra Notes
+# Safe Score Matching
 
-现在这个是jax框架下的Safe Score Matching算法，由QSM方法的Repo修改而来。
+Safe reinforcement learning implementations in JAX, adapted from QSM. The
+`jaxrl5` library includes score matching agents, reachability constrained RL
+(RAC), primal-dual safe RL (CAL), and SAC/TD3 variants.
 
-- jaxrl5/agents，里面有各个agent
+## Repository layout
 
-- rac就是Reachability Constrained Reinforcement Learning论文对应的算法
+| Path | Contents |
+| --- | --- |
+| `jaxrl5/agents/` | Learners, grouped by algorithm |
+| `jaxrl5/envs/` | Safety environments, quadrotor environments, and dynamics |
+| `jaxrl5/networks/` and `jaxrl5/distributions/` | Networks and policy distributions |
+| `jaxrl5/data/` | Datasets and replay buffers |
+| `jaxrl5/tools/` | Checkpoint saving and policy loading |
+| `jaxrl5/utils/`, `jaxrl5/wrappers/`, `jaxrl5/algorithms/` | Shared utilities, wrappers, and update helpers |
+| `examples/states/` | State-based training, including Safety-Gymnasium |
+| `examples/quadrotor/` | Quadrotor training, evaluation, and visualization |
+| `examples/f16/` | F-16 adapters and training |
+| `examples/pixels/` | Pixel-based training and data collection |
+| `launcher/` | Experiment launchers and hyperparameter sweeps |
+| `tests/smoke/` | Standalone learner and environment checks |
+| `docs/` | Training examples and original infrastructure notes |
 
-- cal是Off-Policy Primal-Dual Safe Reinforcement Learning论文对应的算法
+Each example family keeps hyperparameters in its own `configs/` directory.
+Initial-state `.npz` assets remain beside those configurations.
+Generated evaluation results are collected in `results/evaluations/`; see
+[the output directory map](docs/evaluation.md) for their locations.
 
-- examples/states，里面是各个agent在safe-gymnasium环境下面的训练接口
-  - examples/states/configs，这里修改agent核心超参数
-  - scripts/里的scripts/ssm.sh对应选择要train的safe-gymnasium task，比如，cargoal1。此外这里也可以改核心超参数，这里优先级最高。
-  - 现在safe-gymnasium下配置好的agent有：train_score_matching_online（QSM）、train_safe_matching_online（SSM）、train_sac_lag_online、train_sac_cbf_online、train_rac_online（RCRL）、train_cal_online（CAL）。
+## Setup and training
 
-- examples/quadrotor，里面是各个agent在toy case quadrotor环境下面的训练接口
-  - examples/quadrotor/configs，这里修改agent核心超参数
-  - scripts/里的scripts/quadrotor.sh对应选择要train的agent，比如，ssm。此外这里也可以改核心超参数，这里优先级最高。
-  - 现在safe-gymnasium下配置好的agent有：train_safe_matching_online（SSM）、train_sac_lag_online、train_sac_cbf_online、train_rac_online（RCRL）、train_cal_online（CAL）。
-  - 此外，还提供的一些组件方便进行可视化，有关如何运行可视化代码，可以参考scripts/里的scripts/Vh_visual.sh，这个就是能直接画出来之前展示的三张V_h的可视化。我现在把这三张也都上传了，位置在Vh_figures/中。
+For seed-0 Ant/Humanoid RCRL experiments on a new machine, follow
+[the portable setup guide](docs/portable-setup.md) and
+[the reference-style protocol](docs/rcrl-reference-velocity.md). These include
+pinned core dependencies, smoke checks, and periodic evaluation commands.
+
+
+Install the local package into your experiment environment:
+
+```bash
+python -m pip install -e .
+```
+
+The existing dependency list is in [requirements.txt](requirements.txt), moved
+from `temp.txt`. It contains historical minimum versions, not a tested lockfile;
+package installation does not automatically install these dependencies.
+Environment-specific examples may need additional simulator or dataset packages.
+
+Run this Safety-Gymnasium example from the repository root:
+
+```bash
+python examples/states/train_safe_matching_online.py \
+  --config=examples/states/configs/safe_matching_config.py \
+  --env_name=SafetyCarButton1-v0
+```
+
+See [training commands](docs/training.md), [state examples](examples/states/README.md),
+and [pixel examples](examples/pixels/README.md). Commands in the state and pixel
+READMEs use paths relative to their respective directories. The
+[original infrastructure notes](docs/infrastructure.md) are retained for context;
+some referenced external shell scripts are not included in this checkout.
+
+## Checks
+
+See [tests/README.md](tests/README.md) for standalone smoke-test commands. Depending
+on the learner, these exercise updates, action sampling, and checkpoint loading.
+They require the corresponding runtime dependencies.
+
+## Working conventions
+
+Keep reusable code in `jaxrl5/`, runnable experiments in `examples/`, and checks
+in `tests/`. Use an editable installation to pick up library changes without
+reinstalling. Store generated runs in `results/`, `logs/`, `wandb/`, or
+`results/evaluations/`, which Git ignores. Local experiment outputs are retained.

@@ -1,0 +1,154 @@
+diff --git a/respo.py b/respo.py
+index 610a253..1fe56fa 100644
+--- a/respo.py
++++ b/respo.py
+@@ -119,7 +119,7 @@ def respo(env_fn, actor_critic=core_respo.MLPActorCritic, ac_kwargs=dict(), seed
+         steps_per_epoch=30000, epochs=300, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
+         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
+         target_kl=0.01, logger_kwargs=dict(), save_freq=1, penalty_lr=5e-5,
+-        init_penalty=0.25, cost_limit=0):
++        init_penalty=0.25, cost_limit=0, epoch_callback=None):
+ 
+     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
+     setup_pytorch_for_mpi()
+@@ -377,6 +377,9 @@ def respo(env_fn, actor_critic=core_respo.MLPActorCritic, ac_kwargs=dict(), seed
+         logger.log_tabular('StopIter', average_only=True)
+         logger.log_tabular('Time', time.time()-start_time)
+         logger.dump_tabular()
++        if epoch_callback is not None:
++            # This hook sees the policy AFTER this epoch's optimizer updates.
++            epoch_callback(ac, (epoch+1)*steps_per_epoch, penalty_param)
+ 
+ if __name__ == '__main__':
+     import argparse
+diff --git a/train_velocity.py b/train_velocity.py
+new file mode 100644
+--- /dev/null
++++ b/train_velocity.py
+@@ -0,0 +1,85 @@
++"""Matched velocity benchmark; retains RESPO's policy and multiplier losses."""
++
++import argparse
++import csv
++import json
++from pathlib import Path
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++import numpy as np
++import safety_gymnasium
++import torch
++
++from jaxrl5.evaluation import evaluate
++from jaxrl5.wrappers.action_rescale import SymmetricActionWrapper
++from respo import respo
++from velocity_env import VelocityEnv
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('robot', choices=['ant', 'humanoid'])
++    parser.add_argument('--seed', type=int, default=0)
++    parser.add_argument('--max_steps', type=int, default=3000000)
++    parser.add_argument('--steps_per_epoch', type=int, default=30000)
++    parser.add_argument('--cost_limit', type=float, default=10.)
++    parser.add_argument('--eval_episodes', type=int, default=50)
++    parser.add_argument('--max_episode_steps', type=int, default=1000)
++    parser.add_argument('--eval_seed', type=int, default=42)
++    parser.add_argument('--run_name', default=None)
++    args = parser.parse_args()
++    if args.max_steps < 1 or args.steps_per_epoch < 1 or args.max_steps % args.steps_per_epoch:
++        parser.error('max_steps must be a positive multiple of steps_per_epoch')
++    if args.eval_episodes < 1 or args.max_episode_steps < 1:
++        parser.error('Episode count and step limit must be positive')
++    env_name = f'Safety{args.robot.title()}Velocity-v1'
++    name = args.run_name or f'{args.robot}_respo_budget10_3m'
++    run_dir = ROOT / 'results' / env_name / name / f'seed{args.seed:04d}'
++    if run_dir.exists():
++        parser.error(f'Run already exists: {run_dir}; use a new run_name')
++    run_dir.mkdir(parents=True)
++    (run_dir / 'benchmark.json').write_text(json.dumps(dict(vars(args), env_name=env_name), indent=2))
++    eval_env = SymmetricActionWrapper(safety_gymnasium.make(env_name))
++    train_env = VelocityEnv(env_name, seed=args.seed)
++
++    def after_epoch(ac, step, penalty_param):
++        def policy(obs):
++            with torch.no_grad():
++                action = ac.pi._distribution(torch.as_tensor(obs, dtype=torch.float32)).mean.numpy()
++            return np.clip(action, eval_env.action_space.low, eval_env.action_space.high)
++
++        metrics = evaluate(eval_env, policy, episodes=args.eval_episodes,
++                           max_episode_steps=args.max_episode_steps, seed=args.eval_seed)
++        row = dict(step=step, **metrics)
++        path = run_dir / 'history.csv'
++        new_file = not path.exists()
++        with path.open('a', newline='') as f:
++            writer = csv.DictWriter(f, fieldnames=list(row))
++            if new_file:
++                writer.writeheader()
++            writer.writerow(row)
++        checkpoint_dir = run_dir / 'checkpoints'
++        checkpoint_dir.mkdir(exist_ok=True)
++        torch.save(dict(model=ac.state_dict(), step=step, env_name=env_name,
++                        hidden_sizes=[256, 256], penalty_param=penalty_param.detach(),
++                        cost_limit=args.cost_limit), checkpoint_dir / f'ckpt_{step}.pt')
++        print(f"[step {step}] return={metrics['eval/return_mean']:.2f} "
++              f"cost={metrics['eval/cost_mean']:.2f} len={metrics['eval/ep_len_mean']:.1f}", flush=True)
++
++    try:
++        respo(lambda: train_env, ac_kwargs=dict(hidden_sizes=[256, 256]), seed=args.seed,
++              steps_per_epoch=args.steps_per_epoch, epochs=args.max_steps // args.steps_per_epoch,
++              max_ep_len=args.max_episode_steps, cost_limit=args.cost_limit,
++              logger_kwargs=dict(output_dir=str(run_dir), exp_name=name),
++              epoch_callback=after_epoch)
++    finally:
++        train_env.close()
++        eval_env.close()
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/velocity_env.py b/velocity_env.py
+new file mode 100644
+--- /dev/null
++++ b/velocity_env.py
+@@ -0,0 +1,36 @@
++"""Old-Gym API bridge to the exact Safety-Gymnasium velocity-v1 tasks."""
++
++import gym
++import numpy as np
++import safety_gymnasium
++from jaxrl5.wrappers.action_rescale import SymmetricActionWrapper
++
++
++class VelocityEnv:
++    def __init__(self, env_name, seed=0):
++        if env_name not in ('SafetyAntVelocity-v1', 'SafetyHumanoidVelocity-v1'):
++            raise ValueError('Expected Ant or Humanoid velocity-v1')
++        self.env = SymmetricActionWrapper(safety_gymnasium.make(env_name))
++        self._seed = seed
++        ob = self.env.observation_space
++        ac = self.env.action_space
++        self.observation_space = gym.spaces.Box(ob.low, ob.high, dtype=ob.dtype)
++        self.action_space = gym.spaces.Box(ac.low, ac.high, dtype=ac.dtype)
++        self.action_space.seed(seed)
++
++    def reset(self):
++        obs, _ = self.env.reset(seed=self._seed)
++        self._seed = None
++        return obs
++
++    def step(self, action):
++        # PPO uses an unbounded Gaussian; apply valid actions before the
++        # simulator computes both dynamics and action-dependent reward terms.
++        action = np.clip(action, self.action_space.low, self.action_space.high)
++        obs, reward, cost, terminated, truncated, info = self.env.step(action)
++        return obs, reward, bool(terminated or truncated), dict(
++            info, cost=float(cost), **{'TimeLimit.truncated': bool(truncated and not terminated)}
++        )
++
++    def close(self):
++        self.env.close()
