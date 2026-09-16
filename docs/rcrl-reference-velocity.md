@@ -56,10 +56,68 @@ Execution is synchronous JAX on one GPU rather than asynchronous TensorFlow
 workers/learners. We retain the existing replay size and warmup protocol.
 Learning-rate decay is mapped to environment-driven learner updates instead of
 the original 2M asynchronous iterations. Random sampling, separate actor output
-heads, JAX initialization and optimizer numerics differ; stochastic actions in
-individual loss computations are sampled separately. No bitwise parity is claimed.
+heads, JAX initialization and optimizer numerics differ; target actions are sampled separately for reward and safety losses, while
+the temperature update reuses the actor-loss action sample. No bitwise parity is claimed.
 
 Existing configurations retain their prior behavior. Output directories are
 `results/Safety{Ant,Humanoid}Velocity-v1/{ant,humanoid}_rcrl_reference_3m/DATE_seed0000/`.
 Each contains config.json, history.csv, training_metrics.csv and checkpoints.
 The launch log directory contains commands, source hashes and exit-status files.
+
+
+## Twelve-run sweep
+
+`python scripts/train_rcrl_batch.py` queues Humanoid and Ant seeds 0–4 plus
+Swimmer and Hopper seed 0. Every run uses 3,000,000 steps and saves every
+25,000 steps (120 checkpoints per completed run). Other reference settings,
+including evaluation every 30,000 steps, are retained. Swimmer and Hopper
+use signed forward velocity minus their environment threshold as the
+constraint margin; Ant and Humanoid use planar speed.
+
+The batch defaults to two concurrent GPU jobs (`--parallel` overrides this).
+Use `--dry-run` to print commands. Run names include a UTC batch timestamp.
+Logs, the initial queue manifest, per-job status JSON files, package versions,
+and source hashes are saved under `logs/rcrl_batch_TIMESTAMP/`.
+Per-job JSON files track live status; the manifest is finalized when all jobs
+finish. Failed jobs are recorded and the remaining queue continues.
+
+To persist across terminal/SSH disconnects, launch from the repository root:
+
+```bash
+mkdir -p logs
+tmux new-session -d -s rcrl-batch \
+  'exec .venv-rcrl/bin/python -u scripts/train_rcrl_batch.py > logs/rcrl-batch-console.log 2>&1'
+tail -f logs/rcrl-batch-console.log
+```
+
+This survives disconnects while the host remains running; it does not restart
+after reboot. The local `.venv-rcrl` environment on this host inherits simulator
+packages from the `ssm_jax` conda environment and pins JAX/Flax/TFP to the
+repository's recorded versions. Its CUDA plugin package is isolated from the
+inherited newer plugin, and its `nvidia` symlink exposes the inherited CUDA
+wheel libraries at the plugin's expected relative path.
+
+To launch only Swimmer and Hopper seeds 1–4 with the same settings:
+
+```bash
+.venv-rcrl/bin/python scripts/train_rcrl_batch.py --robots swimmer hopper --seeds 1 2 3 4
+```
+
+Use a separate detached tmux session and console log when launching another batch.
+
+See the [implementation fidelity audit](rcrl-fidelity-audit.md) for verified
+optimizer, update-phase, sampling, and diagnostic differences from the clone.
+
+## HalfCheetah and Walker2d
+
+The `cheetah` and `walker` launcher names select `SafetyHalfCheetahVelocity-v1`
+and `SafetyWalker2dVelocity-v1`. Both use signed forward velocity minus the
+environment's threshold as the transition constraint, matching their costs.
+
+```bash
+.venv-rcrl/bin/python scripts/train_rcrl_batch.py \
+  --protocol reference --robots cheetah walker --seeds 0 1 2 3 4
+```
+
+This uses the original reference-style configuration, 3M environment steps,
+checkpoints every 25K, and evaluation every 30K. Batch launches freeze source for queued jobs. Completed Swimmer and Hopper runs are retained.

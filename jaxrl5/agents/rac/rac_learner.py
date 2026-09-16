@@ -554,11 +554,14 @@ class RACLearner(Agent):
             return loss, {
                 "safety_critic_loss": loss,
                 "qh_mean": qh.mean(),
+                "qh_min": qh.min(),
+                "qh_max": qh.max(),
                 "target_qh_mean": target_qh.mean(),
                 "h_mean": h_mean,
             }
 
         grads, info = jax.grad(safety_loss_fn, has_aux=True)(self.safety_critic.params)
+        info["safety_gradient_norm"] = optax.global_norm(grads)
         safety_critic = self.safety_critic.apply_gradients(grads=grads)
         target_params = optax.incremental_update(
             safety_critic.params, self.target_safety_critic.params,
@@ -607,6 +610,7 @@ class RACLearner(Agent):
                 "actor_loss": actor_loss,
                 "entropy": -log_probs.mean(),
                 "logp_mean": log_probs.mean(),
+                "action_saturation_fraction": jnp.mean(jnp.abs(actions) > .99),
                 "alpha": alpha,
             }
 
@@ -714,6 +718,7 @@ class RACLearner(Agent):
                 "actor_loss": actor_info["actor_loss"],
                 "entropy": actor_info["entropy"],
                 "logp_mean": actor_info["logp_mean"],
+                "action_saturation_fraction": actor_info["action_saturation_fraction"],
                 "alpha": temp_info["alpha"],
                 "temperature_loss": temp_info["temperature_loss"],
             }
@@ -723,6 +728,7 @@ class RACLearner(Agent):
                 "actor_loss": jnp.array(0.0, dtype=jnp.float32),
                 "entropy": jnp.array(0.0, dtype=jnp.float32),
                 "logp_mean": jnp.array(0.0, dtype=jnp.float32),
+                "action_saturation_fraction": jnp.array(0.0, dtype=jnp.float32),
                 "alpha": a.temp.apply_fn({"params": a.temp.params}).astype(jnp.float32),
                 "temperature_loss": jnp.array(0.0, dtype=jnp.float32),
             }
@@ -761,6 +767,9 @@ class RACLearner(Agent):
         metrics.update(pol_info)
         metrics.update(lam_info)
 
+        metrics["actor_updated"] = do_pol.astype(jnp.float32)
+        metrics["multiplier_updated"] = do_lam.astype(jnp.float32)
+        metrics["learner_update"] = step.astype(jnp.float32)
         metrics["violation_mean"] = jnp.asarray(batch["costs"]).mean().astype(jnp.float32)
         return agent, metrics
 

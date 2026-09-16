@@ -44,22 +44,26 @@ class ReachabilityTest(unittest.TestCase):
             replay.insert([0], [0], 0., 0., [0], False, False)
 
     def test_velocity_margin_matches_real_cost_without_changing_observations(self):
-        for name in ['SafetyAntVelocity-v1', 'SafetyHumanoidVelocity-v1']:
+        for name in ['SafetyAntVelocity-v1', 'SafetyHumanoidVelocity-v1',
+                     'SafetySwimmerVelocity-v1', 'SafetyHopperVelocity-v1',
+                     'SafetyHalfCheetahVelocity-v1', 'SafetyWalker2dVelocity-v1']:
             with self.subTest(env=name):
                 env = VelocityConstraint(safety_gymnasium.make(name))
                 try:
                     obs, _ = env.reset(seed=0)
                     shape = obs.shape
                     seen = set()
-                    for speed in [0., 10.]:
+                    for speed in [-10., 0., 10.]:
                         env.reset(seed=0)
                         env.unwrapped.data.qvel[0] = speed
                         obs, _, cost, _, _, info = env.step(np.zeros(env.action_space.shape))
                         seen.add(bool(cost))
                         self.assertEqual(obs.shape, shape)
                         self.assertEqual(info['safety_h'] > 0, cost > 0)
-                        self.assertAlmostEqual(info['safety_h'],
-                            np.hypot(info['x_velocity'], info['y_velocity'])-env.velocity_limit)
+                        velocity = (np.hypot(info['x_velocity'], info['y_velocity'])
+                                    if name in ('SafetyAntVelocity-v1', 'SafetyHumanoidVelocity-v1')
+                                    else info['x_velocity'])
+                        self.assertAlmostEqual(info['safety_h'], velocity-env.velocity_limit)
                     self.assertEqual(seen, {False, True})
                 finally:
                     env.close()

@@ -7,7 +7,11 @@ cd "$repo_root"
 case "${1:-}" in
   ant) env_name=SafetyAntVelocity-v1 ;;
   humanoid) env_name=SafetyHumanoidVelocity-v1 ;;
-  *) echo "Usage: bash scripts/train_rcrl_velocity.sh {ant|humanoid} [training flags...]" >&2; exit 2 ;;
+  swimmer) env_name=SafetySwimmerVelocity-v1 ;;
+  hopper) env_name=SafetyHopperVelocity-v1 ;;
+  cheetah) env_name=SafetyHalfCheetahVelocity-v1 ;;
+  walker) env_name=SafetyWalker2dVelocity-v1 ;;
+  *) echo "Usage: bash scripts/train_rcrl_velocity.sh {ant|humanoid|swimmer|hopper|cheetah|walker} [training flags...]" >&2; exit 2 ;;
 esac
 robot="$1"
 shift

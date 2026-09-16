@@ -213,6 +213,9 @@ def main(_):
     episode_return, episode_cost, episode_length = 0.0, 0.0, 0
     epoch_reward, epoch_cost = 0.0, 0.0
     latest_cost_mean = None
+    latest_actor_metrics = {}
+    latest_actor_metrics_step = 0
+    initial_learner_updates = int(agent.update_step)
 
     for step in tqdm.tqdm(
         range(FLAGS.resume_step + 1, FLAGS.max_steps + 1),
@@ -254,12 +257,21 @@ def main(_):
             batch = replay_buffer.sample(FLAGS.batch_size * FLAGS.utd_ratio)
             agent, update_info = agent.update(batch)
 
-            if step % FLAGS.log_interval == 0:
+            learner_iteration = initial_learner_updates + step - update_start + 1
+            if learner_iteration % agent.policy_update_period == 0:
+                latest_actor_metrics = {key: update_info[key] for key in (
+                    'actor_loss', 'entropy', 'logp_mean', 'temperature_loss',
+                    'action_saturation_fraction')}
+                latest_actor_metrics_step = step
+
+            if step % FLAGS.log_interval == 0 and latest_actor_metrics:
                 # Log actual multipliers: update_info contains zero placeholders
                 # on steps where the multiplier optimizer is not scheduled.
                 lam = np.asarray(agent._lambda_values(batch['observations']))
                 diagnostic = {key: float(value) for key, value in update_info.items()}
+                diagnostic.update({key: float(value) for key, value in latest_actor_metrics.items()})
                 diagnostic.update(
+                    actor_metrics_step=latest_actor_metrics_step,
                     step=step, lambda_mean=float(lam.mean()),
                     lambda_min=float(lam.min()), lambda_max_observed=float(lam.max()),
                     lambda_at_cap_fraction=0. if agent.reference_protocol else float(np.mean(lam >= agent.lambda_max)),

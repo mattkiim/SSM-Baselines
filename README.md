@@ -29,7 +29,7 @@ Generated evaluation results are collected in `results/evaluations/`; see
 
 ## Setup and training
 
-For seed-0 Ant/Humanoid RCRL experiments on a new machine, follow
+For RCRL velocity experiments on a new machine, follow
 [the portable setup guide](docs/portable-setup.md) and
 [the reference-style protocol](docs/rcrl-reference-velocity.md). These include
 pinned core dependencies, smoke checks, and periodic evaluation commands.
@@ -59,6 +59,72 @@ and [pixel examples](examples/pixels/README.md). Commands in the state and pixel
 READMEs use paths relative to their respective directories. The
 [original infrastructure notes](docs/infrastructure.md) are retained for context;
 some referenced external shell scripts are not included in this checkout.
+
+## RCRL velocity training commands
+
+After following [the portable setup guide](docs/portable-setup.md), run these
+commands from the repository root with your experiment environment activated.
+The launcher uses `python` from that environment and defaults to CUDA; set
+`RCRL_PYTHON=/path/to/python` to select another interpreter or
+`JAX_PLATFORMS=cpu` for CPU execution.
+
+These commands use the original reference-style protocol and the settings in
+the saved experiment manifests. They show training seed 0; use `--seed=1`
+through `--seed=4` for the other training seeds. Run names below omit the
+historical batch timestamps.
+
+```bash
+# SafetySwimmerVelocity-v1
+bash scripts/train_rcrl_reference.sh swimmer --seed=0 --max_steps=3000000 --save_interval=25000 --notqdm
+
+# SafetyHopperVelocity-v1
+bash scripts/train_rcrl_reference.sh hopper --seed=0 --max_steps=3000000 --save_interval=25000 --notqdm
+
+# SafetyAntVelocity-v1
+bash scripts/train_rcrl_reference.sh ant --seed=0 --max_steps=3000000 --save_interval=25000 --notqdm
+
+# SafetyHumanoidVelocity-v1
+bash scripts/train_rcrl_reference.sh humanoid --seed=0 --max_steps=3000000 --save_interval=25000 --notqdm
+
+# SafetyHalfCheetahVelocity-v1
+bash scripts/train_rcrl_reference.sh cheetah --seed=0 --max_steps=3000000 --save_interval=25000 --notqdm
+
+# SafetyWalker2dVelocity-v1
+bash scripts/train_rcrl_reference.sh walker --seed=0 --max_steps=3000000 --save_interval=25000 --notqdm
+```
+
+All six use [the reference configuration](examples/states/configs/rac_velocity_reference_config.py),
+which inherits [the reachability configuration](examples/states/configs/rac_velocity_reachability_config.py).
+The launchers set 10,000 random warmup steps, a 1,000,000-transition replay
+buffer, batch size 256, and one learner update per environment step after
+warmup. Evaluation runs every 30,000 steps over 50 deterministic episodes
+with seeds 42–91, capped at 1,000 steps each. The explicit save interval above
+matches the experiments: one checkpoint every 25,000 steps.
+
+### Batch commands used for the sweeps
+
+The batches were launched in these groups. Each command queues two concurrent
+GPU jobs by default, assigns timestamped run names, and records its commands
+and status under `logs/rcrl_batch_TIMESTAMP/`.
+
+```bash
+# Humanoid and Ant seeds 0–4, plus Swimmer and Hopper seed 0.
+python scripts/train_rcrl_batch.py
+
+# Remaining Swimmer and Hopper seeds.
+python scripts/train_rcrl_batch.py --robots swimmer hopper --seeds 1 2 3 4
+
+# HalfCheetah and Walker2d seeds 0–4.
+python scripts/train_rcrl_batch.py --protocol reference --robots cheetah walker --seeds 0 1 2 3 4
+```
+
+Add `--dry-run` to a batch command to print its per-run commands without
+starting training. Training outputs are saved under
+`results/Safety<Robot>Velocity-v1/<run_name>/<date>_seedNNNN/`, including
+`config.json`, evaluation history, training metrics, and checkpoints.
+These outputs and batch logs are Git-ignored. See
+[the reference protocol](docs/rcrl-reference-velocity.md) for algorithm details
+and [the completed four-task results](docs/rcrl-results-3m-seeds0-4.md).
 
 ## Checks
 

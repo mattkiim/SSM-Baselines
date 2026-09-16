@@ -80,7 +80,7 @@ class TD3LagLearner(Agent):
     target_policy_noise: float = 0.2
     target_policy_noise_clip: float = 0.5
     actor_delay: int = 2
-    lagrangian_lambda: jnp.ndarray = jnp.array(0.0)
+    lagrangian_lambda: jnp.ndarray = struct.field(default_factory=lambda: jnp.array(0.0))
     lambda_lr: float = struct.field(pytree_node=False, default=1e-3)
     cost_limit: float = struct.field(pytree_node=False, default=0.0)
     lambda_max: Optional[float] = struct.field(pytree_node=False, default=1000.0)
